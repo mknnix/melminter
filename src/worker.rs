@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{repeat_fallible, state::MintState};
+use crate::{repeat_fallible, state::MintState, CmdOpts};
 use dashmap::{mapref::multiple::RefMulti, DashMap};
 use melwallet_client::WalletClient;
 use prodash::{messages::MessageLevel, tree::Item, unit::display::Mode};
@@ -28,11 +28,13 @@ pub struct WorkerConfig {
     pub name: String,
     pub tree: prodash::Tree,
     pub threads: usize,
-    pub diff: Option<usize>, // "Some" if difficulty is fixed, else automatic diff
+
+    pub cli_opts: CmdOpts,
 }
 
 /// Represents a worker.
 pub struct Worker {
+    #[allow(dead_code)]
     send_stop: Sender<()>,
     _task: smol::Task<surf::Result<()>>,
 }
@@ -47,6 +49,7 @@ impl Worker {
         }
     }
 
+    #[allow(dead_code)]
     /// Waits for the worker to complete the current iteration, then stops it.
     pub async fn wait(self) -> surf::Result<()> {
         self.send_stop.send(()).await?;
@@ -57,15 +60,22 @@ impl Worker {
 async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result<()> {
     let tree = opts.tree.clone();
     repeat_fallible(|| async {
+        let cli_opts = opts.cli_opts.clone();
+
         let worker = tree.add_child("worker");
         let worker = Arc::new(Mutex::new(worker));
         let my_speed = compute_speed().await;
         let is_testnet = opts.wallet.summary().await?.network == NetID::Testnet;
         let client = get_valclient(is_testnet, opts.connect).await?;
 
-        let mint_state = MintState::new(opts.wallet.clone(), client.clone());
+        let mut mint_state = MintState::new(opts.wallet.clone(), client.clone());
+        let quit_without_profit = ! cli_opts.disable_profit_failsafe;
+        let max_losts = if let Some(v) = cli_opts.balance_max_losts { Some(v.parse().unwrap()) } else { None };
 
         loop {
+            // check profit status, and/or quitting without incomes
+            mint_state.fee_failsafe(max_losts, quit_without_profit);
+
             // turn off gracefully
             if recv_stop.try_recv().is_ok() {
                 return Ok::<_, surf::Error>(());
@@ -109,6 +119,7 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                     "transferring {} MEL of profits to backup wallet",
                     our_mels
                 ));
+
                 let to_send = opts
                     .wallet
                     .prepare_transaction(
@@ -131,7 +142,7 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
 
             let my_difficulty = {
                 let auto = (my_speed * if is_testnet { 120.0 } else { 30000.0 }).log2().ceil() as usize;
-                match opts.diff {
+                match cli_opts.fixed_diff {
                     None => { auto },
                     Some(diff) => { diff }
                 }
@@ -142,12 +153,12 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                 format!(
                     "Selected difficulty {}: {} (approx. {:?} / tx)",
 
-                    if let Some(_) = opts.diff { "[fixed]" } else { "[auto]" },
+                    if let Some(_) = cli_opts.fixed_diff { "[fixed]" } else { "[auto]" },
                     my_difficulty,
                     approx_iter,
                 ),
             );
-            // repeat because wallet could be out of money
+
             let threads = opts.threads;
             let fastest_speed = client.snapshot().await?.current_header().dosc_speed as f64 / 30.0;
             worker.lock().unwrap().info(format!(
@@ -164,6 +175,8 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                 sub.init(None, None);
                 mint_state.generate_seeds(threads).await?;
             }
+
+            // repeat because wallet could be out of money
             let batch: Vec<(CoinID, CoinDataHeight, Vec<u8>)> = repeat_fallible(|| {
                 let mint_state = &mint_state;
                 let subworkers = Arc::new(DashMap::new());
@@ -184,6 +197,10 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                         let start = Instant::now();
 
                         let total_sum = (total * threads) as f64;
+
+                        let disconnect_timeout = Duration::from_secs(600); // ten minutes
+                        let mut disconnect_started: Option<Instant> = None;
+
                         loop {
                             smol::Timer::after(Duration::from_secs(1)).await;
 
@@ -210,95 +227,140 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                                 .clone()
                                 .swap_many((erg_per_day * 10000.0) as u128, 0);
                             let mel_per_day = mel_per_day as f64 / 10000.0;
-                            let summary = wallet.summary().await.unwrap();
+
+                            let summary = match wallet.summary().await {
+                                Ok(s) => {
+                                    if let Some(_) = disconnect_started {
+                                        disconnect_started = None;
+                                    }
+
+                                    s
+                                },
+                                Err(e) => {
+                                    if let None = disconnect_started {
+                                        log::error!("Failed to get wallet summary: {:?}", e);
+                                        log::warn!("Cannot connect to the melwalletd daemon! Melminter will try again until connected... and the mint progress still continue, BUT PLEASE NOTE: your mint incomes will be ZERO if the daemon connection cannot recovered. For save your CPU computing resources, the program will exit if disconnected a long time (timeout is {:?})", disconnect_timeout);
+                                        disconnect_started = Some(Instant::now());
+                                    }
+
+                                    {
+                                        // display error info.
+                                        let mut new = worker.lock().unwrap().add_child(format!("Failed to connect daemon: {:?}", e));
+                                        new.init(None, None);
+                                        _space = Some(new);
+                                    }
+
+                                    // this check is mainly to prevent un-necessary CPU-time waste.
+                                    if disconnect_started.unwrap().elapsed() > disconnect_timeout {
+                                        log::error!("the daemon connection recovery failed because timeout-ed! ({:?})", disconnect_timeout);
+
+                                        let orig_hook = std::panic::take_hook();
+                                        std::panic::set_hook(Box::new(move |panic_info| {
+                                            orig_hook(panic_info);
+                                            std::process::exit(90);
+                                        }));
+                                        panic!("because still does not recovery the daemon connection, so exit minting to avoid waste the CPU computing resources.");
+                                    }
+
+                                    // to retry...
+                                    continue;
+                                }
+                            };
                             let mel_balance = summary.detailed_balance.get("6d").unwrap();
+
                             let mut new = worker.lock().unwrap().add_child(format!(
                                 "current progress: {} | expected daily return: {:.3} DOSC ≈ {:.3} ERG ≈ {:.3} MEL | fee reserve: {} MEL",
                                 if curr_sum <= 0.0 { "N/A".to_string() } else { format!("{:.2} %", 100.0/(total_sum/curr_sum)) },
                                 dosc_per_day, erg_per_day, mel_per_day, mel_balance
                             ));
                             new.init(None, None);
-                            _space = Some(new)
+                            _space = Some(new);
                         }
                     }))
                 };
 
                 async move {
-                    let res = mint_state
-                        .mint_batch(
-                            my_difficulty,
-                            move |a, b| {
-                                let mut subworker = subworkers.entry(a).or_insert_with(|| {
-                                    let mut child = worker
-                                        .lock()
-                                        .unwrap()
-                                        .add_child(format!("subworker {}", a));
-                                    child.init(
-                                        Some(total),
-                                        Some(prodash::unit::dynamic_and_mode(
-                                            "kH",
-                                            Mode::with_throughput(),
-                                        )),
-                                    );
-                                    child
-                                });
-                                subworker.set(((total as f64) * b) as usize);
-                            },
-                            threads,
-                        )
-                        .await?;
+                    let started = Instant::now();
+
+                    let res = mint_state.mint_batch(
+                        my_difficulty,
+                        move |a, b| {
+                            let mut subworker = subworkers.entry(a).or_insert_with(|| {
+                                let mut child = worker
+                                    .lock()
+                                    .unwrap()
+                                    .add_child(format!("subworker {}", a));
+                                child.init(
+                                    Some(total),
+                                    Some(prodash::unit::dynamic_and_mode(
+                                        "kH",
+                                        Mode::with_throughput(),
+                                    )),
+                                );
+                                child
+                            });
+                            subworker.set(((total as f64) * b) as usize);
+                        },
+                        threads,
+                    ).await?;
+
+                    let ended = started.elapsed();
+                    println!("Proof Completed {} kH (total {} threads) in time {:?} | offset: (approx){:?} - (real){:?} = {}",
+                        total * threads, threads, ended,
+
+                        // calculating deviation for improve the accuracy of predicted time spent...
+                        approx_iter,
+                        ended,
+                        approx_iter.as_secs_f64() - ended.as_secs_f64(), // used for allow negatives, not a sic...
+                    );
+
                     drop(speed_task);
                     Ok::<_, surf::Error>(res)
                 }
-            })
-            .await;
+            }).await;
+
             worker.lock().unwrap().message(
                 MessageLevel::Info,
                 format!("built batch of {} future proofs", batch.len()),
             );
 
             // Time to submit the proofs. For every proof in the batch, we attempt to submit it. If the submission fails, we move on, because there might be some weird race condition with melwalletd going on.
-            // We also attempt to submit transactions in parallel. This is done by retrying *only* on insufficient funds.
-            let mut to_wait = vec![];
+            // We also attempt to submit transactions in parallel. This is done by retrying always (with max count 10).
+            let mut waits = vec![];
             {
                 let mut sub = worker.lock().unwrap().add_child("submitting proof");
                 sub.init(Some(batch.len()), None);
                 for (coin, data, proof) in batch {
                     sub.inc();
                     let reward_attempt = async {
-                        // Retry until we don't see insufficient funds
+                        // Retry until we can submit proof or reach max limit...
+                        let mut errs = 0;
                         let reward_ergs = loop {
                             let snap = client.snapshot().await?;
-                            let reward_speed = 2u128.pow(my_difficulty as u32)
-                                / (snap.current_header().height.0 + 40 - data.height.0) as u128;
-                            let reward = themelio_stf::calculate_reward(
-                                reward_speed * 100,
-                                snap.current_header().dosc_speed,
-                                my_difficulty as u32,
-                                true
-                            );
-                            let reward_ergs =
-                                themelio_stf::dosc_to_erg(snap.current_header().height, reward);
-                            match mint_state
-                                .send_mint_transaction(
-                                    coin,
-                                    my_difficulty,
-                                    proof.clone(),
-                                    reward_ergs.into(),
-                                )
-                                .await
-                            {
+                            let reward_speed = 2u128.pow(my_difficulty as u32) / (snap.current_header().height.0 + 40 - data.height.0) as u128;
+                            let reward = themelio_stf::calculate_reward(reward_speed * 100, snap.current_header().dosc_speed, my_difficulty as u32, true);
+                            let reward_ergs = themelio_stf::dosc_to_erg(snap.current_header().height, reward);
+                            match mint_state.send_mint_transaction(coin, my_difficulty, proof.clone(), reward_ergs.into()).await {
                                 Err(err) => {
+                                    errs += 1;
+
                                     if err.to_string().contains("preparation") || err.to_string().contains("timeout") {
                                         let mut sub = sub.add_child("waiting for available coins");
                                         sub.init(None, None);
                                         smol::Timer::after(Duration::from_secs(10)).await;
                                     } else {
-                                        anyhow::bail!(err)
+                                        log::error!("{:?}", err);
                                     }
+
+                                    if errs >= 10 {
+                                        anyhow::bail!(err);
+                                    }
+
+                                    smol::Timer::after(Duration::from_secs(1)).await;
+                                    continue;
                                 }
                                 Ok(res) => {
-                                    to_wait.push(res);
+                                    waits.push(res);
                                     break reward_ergs;
                                 }
                             }
@@ -308,10 +370,7 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                     }
                     .await;
                     if let Err(err) = reward_attempt {
-                        sub.info(format!(
-                            "FAILED a proof submission for some reason : {:?}",
-                            err
-                        ));
+                        log::error!("FAILED a proof submission for some reason : {:?}", err);
                     }
                 }
             }
@@ -319,8 +378,8 @@ async fn main_async(opts: WorkerConfig, recv_stop: Receiver<()>) -> surf::Result
                 .lock()
                 .unwrap()
                 .add_child("waiting for confirmation of proof");
-            sub.init(Some(to_wait.len()), None);
-            for to_wait in to_wait {
+            sub.init(Some(waits.len()), None);
+            for to_wait in waits {
                 sub.inc();
                 opts.wallet.wait_transaction(to_wait).await?;
             }

@@ -26,9 +26,6 @@ use crate::worker::{Worker, WorkerConfig};
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
 fn main() -> surf::Result<()> {
-    // let log_conf = std::env::var("RUST_LOG").unwrap_or_else(|_| "melminter=debug,warn".into());
-    // std::env::set_var("RUST_LOG", log_conf);
-
     let dash_root = Tree::default();
     let dash_options = line::Options {
         keep_running_if_progress_is_empty: true,
@@ -40,7 +37,16 @@ fn main() -> surf::Result<()> {
     let _handle = line::render(std::io::stdout(), dash_root.clone(), dash_options);
 
     let opts: CmdOpts = CmdOpts::from_args();
-    env_logger::init();
+    {
+        let mut lb = env_logger::Builder::new();
+        if opts.debug {
+            lb.filter(None, log::LevelFilter::Debug);
+        } else {
+            lb.filter(Some("melminter_mod"), log::LevelFilter::Info);
+        }
+        lb.init();
+    }
+
     smol::block_on(async move {
         // either start a daemon, or use the provided one
         let mut _running_daemon = None;
@@ -97,7 +103,6 @@ fn main() -> surf::Result<()> {
                     .context("just-created wallet failed?!")?
             }
         };
-        worker_wallet.unlock(None).await?;
 
         // make sure the working-wallet has enough money (for paying fees)
         while worker_wallet
@@ -117,7 +122,7 @@ fn main() -> surf::Result<()> {
             ));
             smol::Timer::after(Duration::from_secs(1)).await;
 
-            if opts.skip_amount_check { break; }
+            if opts.skip_fee_check { break; }
         }
 
         workers.push(Worker::start(WorkerConfig {
@@ -127,7 +132,8 @@ fn main() -> surf::Result<()> {
             name: "".into(),
             tree: dash_root.clone(),
             threads: opts.threads.unwrap_or_else(num_cpus::get_physical),
-            diff: opts.fixed_diff,
+
+            cli_opts: opts.clone(),
         }));
 
         smol::future::pending().await
